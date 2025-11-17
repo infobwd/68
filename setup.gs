@@ -7,6 +7,7 @@ const SHEET_TEAMS_NAME = "Teams";
 const SHEET_FILES_NAME = "Files";
 const SHEET_SCHOOLS_NAME = "Schools";
 const SHEET_SCHOOL_CLUSTERS_NAME = "SchoolCluster";
+const SHEET_SETTINGS_NAME = "Settings";
 
 /**
  * ฟังก์ชันหลักสำหรับรันเพื่อตั้งค่า Sheet ทั้งหมด
@@ -33,6 +34,7 @@ function setupSheets() {
 
     // สร้าง Sheet รายชื่อโรงเรียน (ตัวอย่าง)
     createSchoolsSheet(spreadsheet);
+    createSettingsSheet(spreadsheet);
     
     SpreadsheetApp.flush();
     Logger.log("🎉 ตั้งค่า Sheet ทั้ง 4 สำเร็จ! (Activities, Teams, Files, Schools)");
@@ -124,20 +126,31 @@ function createTeamsSheet(spreadsheet) {
   
   // ตั้งค่า Header
   const headers = [
-    "TeamID",           // A1
-    "ActivityID",       // B1
-    "TeamName",         // C1
-    "School",           // D1
-    "Level",            // E1
-    "Contact",          // F1 (JSON)
-    "Members",          // G1 (JSON)
-    "RequiredTeachers", // H1
-    "RequiredStudents", // I1
-    "Status",           // J1
-    "LogoUrl",          // K1 (เก็บ File ID โลโก้ทีม)
-    "TeamPhotoId",      // L1 (เก็บ File ID รูปทีม)
-    "CreatedByUserId",  // M1 (รหัสผู้ใช้ที่สร้างทีม)
-    "CreatedByUsername" // N1 (ชื่อผู้ใช้ที่สร้างทีม)
+    "TeamID",               // A1
+    "ActivityID",           // B1
+    "TeamName",             // C1
+    "School",               // D1
+    "Level",                // E1
+    "Contact",              // F1 (JSON)
+    "Members",              // G1 (JSON)
+    "RequiredTeachers",     // H1
+    "RequiredStudents",     // I1
+    "Status",               // J1
+    "LogoUrl",              // K1 (เก็บ File ID โลโก้ทีม)
+    "TeamPhotoId",          // L1 (เก็บ File ID รูปทีม)
+    "CreatedByUserId",      // M1 (รหัสผู้ใช้ที่สร้างทีม)
+    "CreatedByUsername",    // N1 (ชื่อผู้ใช้ที่สร้างทีม)
+    "StatusReason",         // O1
+    "ScoreTotal",           // P1
+    "ScoreManualMedal",     // Q1
+    "RankOverride",         // R1
+    "RepresentativeOverride", // S1
+    "CompetitionStage",     // T1
+    "AreaTeamName",         // U1
+    "AreaContact",          // V1
+    "AreaMembers",          // W1
+    "AreaScore",            // X1
+    "AreaRank"              // Y1
   ];
   
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
@@ -211,22 +224,35 @@ function createSchoolsSheet(spreadsheet) {
 
   sheet.clear();
 
-  const headers = ["SchoolID", "SchoolName", "SchoolCluster"];
+  const headers = ["SchoolID", "SchoolName", "SchoolCluster", "RegistrationMode", "AssignedActivities"];
   const schools = [
-    ["SCH001", "โรงเรียนสาธิตมหาวิทยาลัยเชียงใหม่", "CL001"],
-    ["SCH002", "โรงเรียนเตรียมอุดมศึกษา", "CL002"],
-    ["SCH003", "โรงเรียนสวนกุหลาบวิทยาลัย", "CL002"],
-    ["SCH004", "โรงเรียนเบญจมราชูทิศ", "CL003"],
-    ["SCH005", "โรงเรียนพิษณุโลกพิทยาคม", "CL001"],
-    ["SCH006", "โรงเรียนนครสวรรค์", "CL001"],
-    ["SCH007", "โรงเรียนหาดใหญ่วิทยาคาร", "CL003"],
-    ["SCH008", "โรงเรียนอนุบาลภูเก็ต", "CL003"],
-    ["SCH009", "โรงเรียนสารวิทยา", "CL004"],
-    ["SCH010", "โรงเรียนกรุงเทพคริสเตียนวิทยาลัย", "CL004"]
+    ["SCH001", "โรงเรียนสาธิตมหาวิทยาลัยเชียงใหม่", "CL001", "Self", ""],
+    ["SCH002", "โรงเรียนเตรียมอุดมศึกษา", "CL002", "Group_Assigned", '["act001","act003"]'],
+    ["SCH003", "โรงเรียนสวนกุหลาบวิทยาลัย", "CL002", "Self", ""],
+    ["SCH004", "โรงเรียนเบญจมราชูทิศ", "CL003", "Group_Assigned", '["act002"]'],
+    ["SCH005", "โรงเรียนพิษณุโลกพิทยาคม", "CL001", "Self", ""],
+    ["SCH006", "โรงเรียนนครสวรรค์", "CL001", "Group_Assigned", '["act003"]'],
+    ["SCH007", "โรงเรียนหาดใหญ่วิทยาคาร", "CL003", "Self", ""],
+    ["SCH008", "โรงเรียนอนุบาลภูเก็ต", "CL003", "Self", ""],
+    ["SCH009", "โรงเรียนสารวิทยา", "CL004", "Self", ""],
+    ["SCH010", "โรงเรียนกรุงเทพคริสเตียนวิทยาลัย", "CL004", "Group_Assigned", '["act001"]']
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
   sheet.getRange(2, 1, schools.length, headers.length).setValues(schools);
   sheet.autoResizeColumns(1, headers.length);
   Logger.log(`ตั้งค่า Sheet '${SHEET_SCHOOLS_NAME}' พร้อมรายชื่อโรงเรียนตัวอย่าง ${schools.length} รายการ`);
+}
+
+function createSettingsSheet(spreadsheet) {
+  let sheet = spreadsheet.getSheetByName(SHEET_SETTINGS_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SHEET_SETTINGS_NAME);
+  }
+  sheet.clear();
+  const headers = ["Key", "Value", "UpdatedAt"];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
+  sheet.getRange(2, 1, 1, 3).setValues([["competition_stage", "cluster", new Date()]]);
+  sheet.autoResizeColumns(1, headers.length);
+  Logger.log(`ตั้งค่า Sheet '${SHEET_SETTINGS_NAME}' สำหรับเก็บค่าระบบ`);
 }
