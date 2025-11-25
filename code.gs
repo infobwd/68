@@ -13,6 +13,7 @@ const SHEET_USERS = "Users";
 const SHEET_SCHOOL_CLUSTER = "SchoolCluster";
 const SHEET_SCORE_ASSIGNMENTS = "ScoreAssignments";
 const SHEET_SETTINGS = "Settings";
+const SHEET_JUDGES = "Judges";
 const TEAM_STAGE_COLUMN_INDEX = 20;
 const TEAM_AREA_NAME_COLUMN_INDEX = 21;
 const TEAM_AREA_CONTACT_COLUMN_INDEX = 22;
@@ -47,6 +48,22 @@ const SCHOOL_SHEET_HEADERS = [
   "RegistrationMode",
   "AssignedActivities"
 ];
+const JUDGE_SHEET_HEADERS = [
+  "ActivityID",
+  "ClusterKey",
+  "ClusterLabel",
+  "SchoolID",
+  "SchoolName",
+  "JudgeName",
+  "Role",
+  "Phone",
+  "Email",
+  "ImportedBy",
+  "ImportedAt",
+  "StageScope"
+];
+const EXTERNAL_JUDGE_SCHOOL_ID = "__EXTERNAL__";
+const EXTERNAL_JUDGE_SCHOOL_LABEL = "กรรมการภายนอก";
 
 /**
  * ให้บริการหน้าเว็บหลักเมื่อมีการเรียก GET
@@ -167,11 +184,7 @@ function filterTeamsByCompetitionStage_(teams, stage) {
   if (normalizedStage !== "area") {
     return teams;
   }
-  return teams.filter(team => {
-    const teamStage = normalizeCompetitionStage_(team && team.stage ? team.stage : "");
-    if (teamStage === "area") return true;
-    return normalizeBooleanFlag_(team && team.representativeOverride);
-  });
+  return teams.filter(team => normalizeBooleanFlag_(team && team.representativeOverride));
 }
 
 function syncTeamStagesForCompetitionStage_(sheet, stage) {
@@ -277,16 +290,56 @@ function sanitizeUserRow(row) {
   return record;
 }
 
+function buildUserDisplayName(record) {
+  if (!record) return "";
+  const firstName = (record.name || "").toString().trim();
+  const surname = (record.surname || "").toString().trim();
+  const fullName = [firstName, surname].filter(Boolean).join(" ");
+  if (fullName) return fullName;
+  const username = (record.username || "").toString().trim();
+  if (username) return username;
+  return (record.userid || "").toString().trim();
+}
+
 function publicUserProfile(user) {
   const result = Object.assign({}, user);
   delete result.password;
   result.schoolId = result.SchoolID || "";
+  result.schoolName = result.schoolName || "";
   result.lineUserId = result.userline_id || "";
   result.email = result.email || "";
   result.tel = result.tel || "";
   result.avatarFileId = result.avatarFileId || "";
   if (!result.avatarUrl && result.avatarFileId) {
     result.avatarUrl = buildDriveViewUrl(result.avatarFileId);
+  }
+  try {
+    const schoolsIndex = buildSchoolsIndex_();
+    const schoolInfo =
+      lookupSchoolById_(schoolsIndex, result.schoolId) ||
+      lookupSchoolByName_(schoolsIndex, result.schoolName || "");
+    if (schoolInfo) {
+      if (!result.schoolName && schoolInfo.name) {
+        result.schoolName = schoolInfo.name;
+      }
+      if (!result.schoolClusterId && (schoolInfo.clusterId || schoolInfo.cluster)) {
+        result.schoolClusterId = schoolInfo.clusterId || schoolInfo.cluster || "";
+      }
+      if (!result.schoolCluster && (schoolInfo.clusterName || schoolInfo.cluster)) {
+        result.schoolCluster = schoolInfo.clusterName || schoolInfo.cluster || "";
+      }
+    }
+  } catch (error) {
+    Logger.log("publicUserProfile cluster lookup error: " + error);
+  }
+  if (!result.clusterId && result.schoolClusterId) {
+    result.clusterId = result.schoolClusterId;
+  }
+  if (!result.cluster && result.schoolCluster) {
+    result.cluster = result.schoolCluster;
+  }
+  if (!result.clusterLabel && result.cluster) {
+    result.clusterLabel = result.cluster;
   }
   return result;
 }
@@ -329,6 +382,10 @@ function normalizeKey(value) {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function normalizeEmailKey_(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
 function ensureSchoolsSheetStructure_(sheet) {
   if (!sheet) {
     return;
@@ -353,12 +410,232 @@ function ensureSchoolsSheetStructure_(sheet) {
   }
 }
 
+function ensureJudgeSheet_(spreadsheet) {
+  const book = spreadsheet || SpreadsheetApp.openById(SHEET_ID);
+  let sheet = book.getSheetByName(SHEET_JUDGES);
+  if (!sheet) {
+    sheet = book.insertSheet(SHEET_JUDGES);
+  }
+  const expectedLength = JUDGE_SHEET_HEADERS.length;
+  if (sheet.getLastColumn() < expectedLength) {
+    sheet.insertColumnsAfter(sheet.getLastColumn(), expectedLength - sheet.getLastColumn());
+  }
+  const headerRange = sheet.getRange(1, 1, 1, expectedLength);
+  const currentHeaders = headerRange.getValues()[0];
+  let needsUpdate = currentHeaders.length !== expectedLength;
+  if (!needsUpdate) {
+    needsUpdate = currentHeaders.some((value, index) => value !== JUDGE_SHEET_HEADERS[index]);
+  }
+  if (needsUpdate) {
+    headerRange.setValues([JUDGE_SHEET_HEADERS]).setFontWeight("bold");
+  }
+  return sheet;
+}
+
+function readBlobAsUtf8String_(blob) {
+  if (!blob) {
+    return "";
+  }
+  const stripBom = text => (text || "").replace(/^\uFEFF/, "");
+  try {
+    const utf8Text = blob.getDataAsString("UTF-8");
+    if (utf8Text) {
+      return stripBom(utf8Text);
+    }
+  } catch (error) {
+    // fallback handled below
+  }
+  try {
+    const fallbackText = blob.getDataAsString();
+    return stripBom(fallbackText);
+  } catch (error) {
+    return "";
+  }
+}
+
+function parseJudgeUploadMatrix_(fileData) {
+  if (!fileData || !fileData.base64Data) {
+    throw new Error("ไม่พบไฟล์สำหรับนำเข้า");
+  }
+  const mimeType = (fileData.mimeType || "").toLowerCase();
+  const fileName = (fileData.fileName || "upload").toLowerCase();
+  const decoded = Utilities.base64Decode(fileData.base64Data);
+  const blob = Utilities.newBlob(decoded, fileData.mimeType || MimeType.CSV, fileData.fileName || "judges");
+  const looksLikeCsv = mimeType.includes("csv") || mimeType.includes("text") || fileName.endsWith(".csv");
+  const looksLikeExcel = mimeType.includes("spreadsheetml") || mimeType.includes("excel") || fileName.endsWith(".xlsx") || fileName.endsWith(".xls");
+  let matrix = [];
+  if (looksLikeCsv && !looksLikeExcel) {
+    const content = readBlobAsUtf8String_(blob);
+    if (!content) {
+      throw new Error("ไม่สามารถอ่านไฟล์ CSV เป็น UTF-8 ได้");
+    }
+    matrix = Utilities.parseCsv(content);
+  } else if (looksLikeExcel) {
+    const tempFile = DriveApp.createFile(blob);
+    try {
+      const ss = SpreadsheetApp.open(tempFile);
+      const sheet = ss.getSheets()[0];
+      matrix = sheet.getDataRange().getDisplayValues();
+    } finally {
+      tempFile.setTrashed(true);
+    }
+  } else {
+    throw new Error("รองรับเฉพาะไฟล์ CSV หรือ Excel (.xlsx)");
+  }
+  return (matrix || []).filter(row => Array.isArray(row) && row.some(cell => String(cell || "").trim() !== ""));
+}
+
+function buildJudgeRecordsFromMatrix_(matrix, options) {
+  if (!Array.isArray(matrix) || !matrix.length) return [];
+  const opts = options || {};
+  const fallbackActivityId = (opts.activityId || "").toString().trim();
+  const clusterKeyRawInput = (opts.clusterKey || "").toString();
+  const fallbackClusterKey = normalizeKey(clusterKeyRawInput);
+  const fallbackClusterLabel = (opts.clusterLabel || clusterKeyRawInput || "").toString();
+  const stageScope = normalizeJudgeStageScope_(opts.stageScope);
+  const schoolIndex = opts.schoolIndex || buildSchoolsIndex_();
+  const header = matrix[0].map(value => normalizeJudgeHeader_(value));
+  const findIndex = synonyms => {
+    for (let i = 0; i < synonyms.length; i++) {
+      const normalizedSynonym = normalizeJudgeHeader_(synonyms[i]);
+      const idx = header.indexOf(normalizedSynonym);
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+  const idxActivity = findIndex(["activityid", "activity_id", "activity", "กิจกรรม"]);
+  if (!fallbackActivityId && idxActivity === -1) {
+    throw new Error("ไฟล์ต้องมีคอลัม ActivityID หรือเลือกกิจกรรมก่อนนำเข้า");
+  }
+  const idxClusterKey = findIndex(["clusterkey", "cluster_key", "cluster", "network", "networkkey", "เครือข่าย"]);
+  if (!fallbackClusterKey && idxClusterKey === -1) {
+    throw new Error("ไฟล์ต้องมีคอลัม ClusterKey หรือเลือกเครือข่ายก่อนนำเข้า");
+  }
+  const idxClusterLabel = findIndex(["clusterlabel", "cluster_label", "networklabel", "ชื่อเครือข่าย", "clustername"]);
+  const idxName = findIndex(["name", "fullname", "judge", "judge name", "กรรมการ", "ชื่อกรรมการ", "ชื่อ"]);
+  if (idxName === -1) throw new Error("ไม่พบคอลัมชื่อกรรมการ");
+  const idxSchool = findIndex(["schoolid", "school_id", "school code", "schoolcode", "school", "รหัสโรงเรียน"]);
+  if (idxSchool === -1) throw new Error("ไม่พบคอลัม SchoolID");
+  const idxRole = findIndex(["role", "position", "หน้าที่"]);
+  const idxPhone = findIndex(["phone", "tel", "telephone", "เบอร์โทร", "เบอร์โทรศัพท์"]);
+  const idxEmail = findIndex(["email", "mail", "อีเมล"]);
+  const normalizeCell = (row, idx) => {
+    if (idx === -1) return "";
+    const value = row[idx];
+    return value === null || value === undefined ? "" : value.toString().trim();
+  };
+  const dataset = [];
+  for (let i = 1; i < matrix.length; i++) {
+    const row = matrix[i];
+    if (!Array.isArray(row)) continue;
+    const judgeName = normalizeCell(row, idxName);
+    const schoolIdRaw = normalizeCell(row, idxSchool);
+    if (!judgeName || !schoolIdRaw) continue;
+    const resolvedActivityId = (idxActivity !== -1 ? normalizeCell(row, idxActivity) : "") || fallbackActivityId;
+    if (!resolvedActivityId) continue;
+    const clusterKeyValue = (idxClusterKey !== -1 ? normalizeCell(row, idxClusterKey) : "") || clusterKeyRawInput;
+    const normalizedClusterKey = clusterKeyValue ? normalizeKey(clusterKeyValue) : fallbackClusterKey;
+    if (!normalizedClusterKey) continue;
+    const external = isExternalJudgeSchoolId_(schoolIdRaw);
+    const schoolInfo = external ? null : lookupSchoolById_(schoolIndex, schoolIdRaw);
+    if (!external && !schoolInfo) {
+      throw new Error(`ไม่พบ SchoolID "${schoolIdRaw}" ในชีต Schools (แถว ${i + 1})`);
+    }
+    const schoolClusterLabel = schoolInfo?.clusterName || schoolInfo?.cluster || "";
+    const indexedClusterLabel = resolveClusterLabelFromIndex_(schoolIndex, normalizedClusterKey);
+    const resolvedClusterLabel =
+      (idxClusterLabel !== -1 ? normalizeCell(row, idxClusterLabel) : "") ||
+      schoolClusterLabel ||
+      indexedClusterLabel ||
+      fallbackClusterLabel ||
+      clusterKeyValue ||
+      normalizedClusterKey;
+    const resolvedSchoolId = external ? EXTERNAL_JUDGE_SCHOOL_ID : (schoolInfo?.id || schoolIdRaw);
+    const resolvedSchoolName = external ? EXTERNAL_JUDGE_SCHOOL_LABEL : (schoolInfo?.name || schoolIdRaw);
+    dataset.push({
+      activityId: resolvedActivityId,
+      clusterKey: normalizedClusterKey,
+      clusterLabel: resolvedClusterLabel,
+      schoolId: resolvedSchoolId,
+      schoolName: resolvedSchoolName,
+      judgeName,
+      role: normalizeCell(row, idxRole),
+      phone: normalizeCell(row, idxPhone),
+      email: normalizeCell(row, idxEmail),
+      stageScope
+    });
+  }
+  return dataset;
+}
+
+function resolveClusterLabelFromIndex_(index, clusterKey) {
+  if (!index || !clusterKey) {
+    return "";
+  }
+  const normalizedKey = normalizeKey(clusterKey);
+  if (!normalizedKey) {
+    return "";
+  }
+  const map = index.clusterMap || buildSchoolClusterMap_();
+  if (!index.clusterMap) {
+    index.clusterMap = map;
+  }
+  if (!map) {
+    return "";
+  }
+  const hit =
+    (map.byId && map.byId[normalizedKey]) ||
+    (map.byName && map.byName[normalizedKey]);
+  return hit && hit.name ? hit.name : "";
+}
+
+function normalizeJudgeHeader_(value) {
+  return (value || "")
+    .toString()
+    .replace(/\uFEFF/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_\-]+/g, "");
+}
+
 function normalizeRegistrationMode_(value) {
   const raw = normalizeKey(value);
   if (raw === "group" || raw === "group_assigned" || raw === "assigned" || raw === "network") {
     return "group_assigned";
   }
   return "self";
+}
+
+function isExternalJudgeSchoolId_(value) {
+  const normalized = normalizeKey(value);
+  if (!normalized) return false;
+  const externalIdKey = normalizeKey(EXTERNAL_JUDGE_SCHOOL_ID);
+  const externalLabelKey = normalizeKey(EXTERNAL_JUDGE_SCHOOL_LABEL);
+  return normalized === externalIdKey || normalized === externalLabelKey;
+}
+
+function normalizeJudgeStageScope_(value) {
+  const normalized = (value || "").toString().trim().toLowerCase();
+  return normalized === "area" ? "area" : "cluster";
+}
+
+function formatSheetPhoneValue_(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  const stringValue = value.toString().trim();
+  if (!stringValue) {
+    return "";
+  }
+  if (/^\d+$/.test(stringValue)) {
+    if (stringValue.startsWith("0")) {
+      return stringValue;
+    }
+    if (stringValue.length === 9) {
+      return "0" + stringValue;
+    }
+  }
+  return stringValue;
 }
 
 function formatRegistrationModeForSheet_(mode) {
@@ -787,22 +1064,18 @@ function findUserByUsername(username) {
 }
 
 function findUserByEmail(email) {
-  const key = normalizeKey(email);
-  if (!key) {
-    return null;
-  }
+  const normalized = normalizeEmailKey_(email);
+  if (!normalized) return null;
   const sheet = getUsersSheet();
   const rows = getAllUserRows_(sheet);
   const emailIndex = USER_SHEET_HEADERS.indexOf("email");
-  if (emailIndex === -1) {
-    return null;
-  }
+  if (emailIndex === -1) return null;
   for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    if (normalizeKey(row[emailIndex]) === key) {
+    const rowEmail = normalizeEmailKey_(rows[i][emailIndex]);
+    if (rowEmail && rowEmail === normalized) {
       return {
         rowIndex: i + 2,
-        user: sanitizeUserRow(row)
+        user: sanitizeUserRow(rows[i])
       };
     }
   }
@@ -926,9 +1199,9 @@ function registerNormalUser(payload) {
       if (existing) {
         throw new Error("ชื่อผู้ใช้ถูกใช้แล้ว");
       }
-      const duplicateEmail = findUserByEmail(email);
-      if (duplicateEmail) {
-        throw new Error("อีเมลถูกใช้แล้ว");
+      const emailOwner = findUserByEmail(email);
+      if (emailOwner) {
+        throw new Error("อีเมลนี้ถูกใช้แล้ว");
       }
       const sheet = getUsersSheet();
       const userId = generateUserId();
@@ -966,45 +1239,40 @@ function registerNormalUser(payload) {
   }
 }
 
-function checkUserAvailability(payload) {
+function checkAccountAvailability(payload) {
   try {
     const data = payload || {};
     const username = (data.username || "").toString().trim();
     const email = (data.email || "").toString().trim();
-    if (!username && !email) {
-      return {
-        success: false,
-        error: "กรุณาระบุชื่อผู้ใช้หรืออีเมล"
-      };
-    }
-    const conflicts = [];
-    if (username && findUserByUsername(username)) {
-      conflicts.push("username");
-    }
-    if (email && findUserByEmail(email)) {
-      conflicts.push("email");
-    }
-    if (conflicts.length) {
-      let message = "";
-      if (conflicts.includes("username") && conflicts.includes("email")) {
-        message = "ชื่อผู้ใช้และอีเมลถูกใช้งานแล้ว";
-      } else if (conflicts[0] === "username") {
-        message = "ชื่อผู้ใช้ถูกใช้งานแล้ว";
-      } else {
-        message = "อีเมลถูกใช้งานแล้ว";
+    const result = {
+      success: true,
+      username: { available: true },
+      email: { available: true }
+    };
+    if (username) {
+      const existing = findUserByUsername(username);
+      if (existing) {
+        result.username.available = false;
+        result.username.message = "ชื่อผู้ใช้ถูกใช้แล้ว";
       }
-      return {
-        success: false,
-        conflicts,
-        error: message
-      };
+    } else {
+      result.username.available = false;
     }
-    return { success: true };
+    if (email) {
+      const existingEmail = findUserByEmail(email);
+      if (existingEmail) {
+        result.email.available = false;
+        result.email.message = "อีเมลนี้ถูกใช้แล้ว";
+      }
+    } else {
+      result.email.available = false;
+    }
+    return result;
   } catch (error) {
-    Logger.log("checkUserAvailability error: " + error);
+    Logger.log("checkAccountAvailability error: " + error);
     return {
       success: false,
-      error: error.message || "ไม่สามารถตรวจสอบข้อมูลได้"
+      error: error.message
     };
   }
 }
@@ -1354,29 +1622,34 @@ function getRegisteredTeams() {
     const colCount = Math.min(lastCol, TEAM_SHEET_MAX_COLS);
     const data = sheet.getRange(2, 1, lastRow - 1, colCount).getValues();
     const teams = data.map(row => {
-      const rawScore = row.length > 15 ? Number(row[15]) : null;
-      const parsedScore = typeof rawScore === 'number' && !isNaN(rawScore) ? rawScore : null;
+      const rawScoreValue = row.length > 15 ? row[15] : "";
+      const parsedScore = parseScoreValue_(rawScoreValue);
       const stageValue = normalizeCompetitionStage_(row.length > 19 ? row[19] : '');
-    const areaTeamName = row.length > 20 ? row[20] : '';
-    const areaContact = row.length > 21 ? row[21] : '';
-    const areaMembers = row.length > 22 ? row[22] : '';
-    const areaScore = row.length > 23 ? row[23] : '';
-    const areaRank = row.length > 24 ? row[24] : '';
-    return {
-      teamId: row[0],
-      activity: row[1],
-      teamName: row[2],
-      teamNameCluster: row[2],
-      teamNameArea: areaTeamName,
-      school: row[3],
-      level: row[4],
-      contact: row[5],
-      members: row[6],
-      contactArea: areaContact,
-      membersArea: areaMembers,
-      areaScore: areaScore,
-      areaRank: areaRank,
-      requiredTeachers: row[7],
+      const areaTeamName = row.length > 20 ? row[20] : '';
+      const areaContact = row.length > 21 ? row[21] : '';
+      const areaMembers = row.length > 22 ? row[22] : '';
+      const areaScore = row.length > 23 ? row[23] : '';
+      const areaRank = row.length > 24 ? row[24] : '';
+      const rawRepresentative = row.length > 18 ? row[18] : '';
+      const representativeFlag = typeof rawRepresentative === 'boolean'
+        ? rawRepresentative
+        : String(rawRepresentative || '').trim().toLowerCase() === 'true';
+      const effectiveStage = stageValue || (representativeFlag ? 'area' : 'cluster');
+      return {
+        teamId: row[0],
+        activity: row[1],
+        teamName: row[2],
+        teamNameCluster: row[2],
+        teamNameArea: areaTeamName,
+        school: row[3],
+        level: row[4],
+        contact: row[5],
+        members: row[6],
+        contactArea: areaContact,
+        membersArea: areaMembers,
+        areaScore: areaScore,
+        areaRank: areaRank,
+        requiredTeachers: row[7],
         requiredStudents: row[8],
         status: row[9],
         logoUrl: row.length > 10 ? row[10] : '',
@@ -1387,8 +1660,9 @@ function getRegisteredTeams() {
         scoreTotal: parsedScore,
         scoreManualMedal: row.length > 16 ? row[16] : '',
         rankOverride: row.length > 17 ? row[17] : '',
-        representativeOverride: row.length > 18 ? row[18] : '',
-        stage: stageValue || 'cluster'
+        representativeOverride: rawRepresentative,
+        isRepresentative: representativeFlag,
+        stage: effectiveStage
       };
     });
 
@@ -1396,6 +1670,393 @@ function getRegisteredTeams() {
   } catch (error) {
     Logger.log(error);
     return { error: error.message };
+  }
+}
+
+function getJudgeAssignments(payload) {
+  try {
+    const data = payload || {};
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor) {
+      throw new Error("กรุณาเข้าสู่ระบบ");
+    }
+    const sheet = ensureJudgeSheet_(spreadsheet);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return [];
+    const values = sheet
+      .getRange(2, 1, lastRow - 1, JUDGE_SHEET_HEADERS.length)
+      .getValues();
+    const records = [];
+    values.forEach((row, index) => {
+      if (!Array.isArray(row) || !row.some(cell => cell !== "")) {
+        return;
+      }
+      records.push({
+        rowNumber: index + 2,
+        activityId: (row[0] || "").toString().trim(),
+        clusterKey: (row[1] || "").toString().trim(),
+        clusterLabel: row[2] || "",
+        schoolId: row[3] || "",
+        schoolName: row[4] || "",
+        judgeName: row[5] || "",
+        role: row[6] || "",
+        phone: formatSheetPhoneValue_(row[7] || ""),
+        email: row[8] || "",
+        importedBy: row[9] || "",
+        importedAt:
+          row[10] instanceof Date
+            ? row[10].toISOString()
+            : (row[10] || "").toString(),
+        stageScope: normalizeJudgeStageScope_(row[11] || "")
+      });
+    });
+    return records;
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+function importJudges(payload) {
+  try {
+    const data = payload || {};
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor) throw new Error("กรุณาเข้าสู่ระบบ");
+    const allowedLevels = ["admin", "area", "group_admin"];
+    if (!allowedLevels.includes(actor.normalizedLevel || "")) {
+      throw new Error("คุณไม่มีสิทธิ์นำเข้ารายชื่อกรรมการ");
+    }
+    const activityId = (data.activityId || "").toString().trim();
+    const clusterKeyRaw = (data.clusterKey || "").toString().trim();
+    const normalizedClusterKey = normalizeKey(clusterKeyRaw);
+    if (!normalizedClusterKey) {
+      throw new Error("กรุณาเลือกเครือข่ายก่อนนำเข้า");
+    }
+    const clusterLabel = (data.clusterLabel || clusterKeyRaw || "").toString();
+    const stageScope = normalizeJudgeStageScope_(data.stageScope);
+    if (actor.normalizedLevel === "group_admin") {
+      if (!actor.clusterNormalized) {
+        throw new Error("บัญชีผู้ใช้ยังไม่ได้ผูกกับเครือข่าย");
+      }
+      if (normalizedClusterKey !== actor.clusterNormalized) {
+        throw new Error("คุณสามารถจัดการเฉพาะเครือข่ายของคุณเท่านั้น");
+      }
+    }
+    const sheet = ensureJudgeSheet_(spreadsheet);
+    const matrix = parseJudgeUploadMatrix_(data.fileData);
+    const judgeRecords = buildJudgeRecordsFromMatrix_(matrix, {
+      activityId,
+      clusterKey: clusterKeyRaw || normalizedClusterKey,
+      clusterLabel,
+      schoolIndex: schoolsIndex,
+      stageScope
+    });
+    const scopedRecords = judgeRecords.filter(record => normalizeKey(record.clusterKey) === normalizedClusterKey);
+    if (!scopedRecords.length) {
+      throw new Error("ไม่พบข้อมูลของเครือข่ายนี้ในไฟล์ที่อัปโหลด");
+    }
+    const importer = actor.username || actor.userId || actor.email || "";
+    const timestamp = new Date();
+    const newRows = scopedRecords.map(record => [
+      record.activityId,
+      record.clusterKey,
+      record.clusterLabel || clusterLabel,
+      record.schoolId,
+      record.schoolName || "",
+      record.judgeName,
+      record.role || "",
+      record.phone || "",
+      record.email || "",
+      importer,
+      timestamp,
+      record.stageScope || stageScope
+    ]);
+    const lastRow = sheet.getLastRow();
+    const existingRaw =
+      lastRow > 1
+        ? sheet
+            .getRange(2, 1, lastRow - 1, JUDGE_SHEET_HEADERS.length)
+            .getValues()
+        : [];
+    const existing = existingRaw.filter(row =>
+      Array.isArray(row) && row.some(cell => cell !== "")
+    );
+    const replacementKeys = new Set(
+      scopedRecords.map(record => {
+        const keyActivity = normalizeKey(record.activityId);
+        const keyCluster = normalizeKey(record.clusterKey);
+        return `${keyActivity}::${keyCluster}`;
+      })
+    );
+    const filteredExisting = existing.filter(row => {
+      const rowActivity = normalizeKey(row[0] || "");
+      const rowCluster = normalizeKey(row[1] || "");
+      return !replacementKeys.has(`${rowActivity}::${rowCluster}`);
+    });
+    const combined = filteredExisting.concat(newRows);
+    if (lastRow > 1) {
+      sheet
+        .getRange(2, 1, lastRow - 1, JUDGE_SHEET_HEADERS.length)
+        .clearContent();
+    }
+    if (combined.length) {
+      sheet
+        .getRange(2, 1, combined.length, JUDGE_SHEET_HEADERS.length)
+        .setValues(combined);
+    }
+    return { success: true, count: newRows.length };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function addJudge(payload) {
+  try {
+    const data = payload || {};
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor) throw new Error("กรุณาเข้าสู่ระบบ");
+    const allowed = ["admin", "area", "group_admin"];
+    if (!allowed.includes(actor.normalizedLevel || "")) {
+      throw new Error("คุณไม่มีสิทธิ์เพิ่มกรรมการ");
+    }
+    const activityId = (data.activityId || "").toString().trim();
+    const clusterRaw = (data.clusterKey || "").toString();
+    const clusterKey = normalizeKey(clusterRaw);
+    const clusterLabel = (data.clusterLabel || clusterRaw || "").toString();
+    const schoolIdInput = (data.schoolId || "").toString().trim();
+    const judgeName = (data.judgeName || "").toString().trim();
+    const role = (data.role || "").toString().trim();
+    const phone = (data.phone || "").toString().trim();
+    const email = (data.email || "").toString().trim();
+    const stageScope = normalizeJudgeStageScope_(data.stageScope);
+    if (!activityId) throw new Error("กรุณาระบุรหัสกิจกรรม");
+    if (!schoolIdInput) throw new Error("กรุณาเลือกโรงเรียน");
+    if (!judgeName) throw new Error("กรุณากรอกชื่อกรรมการ");
+    if (actor.normalizedLevel === "group_admin") {
+      if (!actor.clusterNormalized) {
+        throw new Error("บัญชีผู้ใช้นี้ยังไม่ได้ระบุเครือข่าย");
+      }
+      if (clusterKey !== actor.clusterNormalized) {
+        throw new Error("คุณสามารถจัดการเฉพาะเครือข่ายของตนเอง");
+      }
+    }
+    if (stageScope === "area" && !["admin", "area"].includes(actor.normalizedLevel || "")) {
+      throw new Error("เฉพาะ Admin หรือ Area เท่านั้นที่เพิ่มกรรมการระดับเขตได้");
+    }
+    const externalSchool = isExternalJudgeSchoolId_(schoolIdInput);
+    const schoolRecord = externalSchool ? null : lookupSchoolById_(schoolsIndex, schoolIdInput);
+    if (!externalSchool && !schoolRecord) {
+      throw new Error(`ไม่พบ SchoolID "${schoolIdInput}" ในระบบ`);
+    }
+    const sheet = ensureJudgeSheet_(spreadsheet);
+    const importer = actor.username || actor.userId || actor.email || "";
+    const timestamp = new Date();
+    const resolvedClusterLabel =
+      clusterLabel ||
+      schoolRecord?.cluster ||
+      schoolRecord?.clusterName ||
+      schoolRecord?.clusterLabel ||
+      "";
+    const resolvedSchoolId = externalSchool ? EXTERNAL_JUDGE_SCHOOL_ID : (schoolRecord?.id || schoolIdInput);
+    const resolvedSchoolName = externalSchool ? EXTERNAL_JUDGE_SCHOOL_LABEL : (schoolRecord?.name || schoolIdInput);
+    sheet.appendRow([
+      activityId,
+      clusterKey,
+      resolvedClusterLabel,
+      resolvedSchoolId,
+      resolvedSchoolName,
+      judgeName,
+      role,
+      phone,
+      email,
+      importer,
+      timestamp,
+      stageScope
+    ]);
+    return {
+      success: true,
+      record: {
+        rowNumber: sheet.getLastRow(),
+        activityId,
+        clusterKey,
+        clusterLabel: resolvedClusterLabel,
+        schoolId: resolvedSchoolId,
+        schoolName: resolvedSchoolName,
+        judgeName,
+        role,
+        phone,
+        email,
+        importedBy: importer,
+        importedAt: timestamp.toISOString(),
+        stageScope
+      }
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function updateJudge(payload) {
+  try {
+    const data = payload || {};
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor) throw new Error("กรุณาเข้าสู่ระบบ");
+    const allowed = ["admin", "area", "group_admin"];
+    if (!allowed.includes(actor.normalizedLevel || "")) {
+      throw new Error("คุณไม่มีสิทธิ์แก้ไขกรรมการ");
+    }
+    const rowNumber = parseInt(data.rowNumber, 10);
+    if (!rowNumber || rowNumber < 2) {
+      throw new Error("ข้อมูลกรรมการไม่ถูกต้อง");
+    }
+    const sheet = ensureJudgeSheet_(spreadsheet);
+    const lastRow = sheet.getLastRow();
+    if (rowNumber > lastRow) {
+      throw new Error("ไม่พบกรรมการที่ต้องการแก้ไข");
+    }
+    const rowValues = sheet
+      .getRange(rowNumber, 1, 1, JUDGE_SHEET_HEADERS.length)
+      .getValues()[0];
+    if (!rowValues || !rowValues.some(value => value !== "")) {
+      throw new Error("ไม่พบข้อมูลกรรมการ");
+    }
+    const originalCluster = normalizeKey(rowValues[1] || "");
+    if (actor.normalizedLevel === "group_admin") {
+      if (!actor.clusterNormalized) {
+        throw new Error("บัญชีผู้ใช้นี้ยังไม่ได้ระบุเครือข่าย");
+      }
+      if (originalCluster !== actor.clusterNormalized) {
+        throw new Error("คุณสามารถจัดการเฉพาะเครือข่ายของคุณเท่านั้น");
+      }
+    }
+    const activityId = (data.activityId || rowValues[0] || "").toString().trim();
+    if (!activityId) {
+      throw new Error("กรุณาระบุรหัสกิจกรรม");
+    }
+    const clusterRaw = (data.clusterKey || rowValues[1] || "").toString();
+    const clusterKey = normalizeKey(clusterRaw);
+    if (!clusterKey) {
+      throw new Error("กรุณาระบุเครือข่าย");
+    }
+    if (actor.normalizedLevel === "group_admin" && clusterKey !== actor.clusterNormalized) {
+      throw new Error("คุณสามารถจัดการเฉพาะเครือข่ายของคุณเท่านั้น");
+    }
+    const schoolIdInput = (data.schoolId || "").toString().trim();
+    const judgeName = (data.judgeName || "").toString().trim();
+    if (!schoolIdInput) throw new Error("กรุณาเลือกโรงเรียน");
+    if (!judgeName) throw new Error("กรุณากรอกชื่อกรรมการ");
+    const externalSchool = isExternalJudgeSchoolId_(schoolIdInput);
+    const schoolRecord = externalSchool ? null : lookupSchoolById_(schoolsIndex, schoolIdInput);
+    if (!externalSchool && !schoolRecord) {
+      throw new Error(`ไม่พบ SchoolID "${schoolIdInput}" ในระบบ`);
+    }
+    if (!externalSchool && actor.normalizedLevel === "group_admin") {
+      if (!doesSchoolMatchCluster_(schoolRecord, actor.clusterNormalized)) {
+        throw new Error("คุณสามารถเลือกโรงเรียนภายในเครือข่ายของคุณเท่านั้น");
+      }
+    }
+    const resolvedClusterLabel =
+      (data.clusterLabel || rowValues[2] || schoolRecord?.clusterLabel || schoolRecord?.cluster || "").toString();
+    const role = (data.role || "").toString().trim();
+    const phone = (data.phone || "").toString().trim();
+    const email = (data.email || "").toString().trim();
+    const existingStageScope = normalizeJudgeStageScope_(rowValues[rowValues.length - 1] || "");
+    const stageScopeInput = data.stageScope ? normalizeJudgeStageScope_(data.stageScope) : existingStageScope;
+    if (stageScopeInput === "area" && !["admin", "area"].includes(actor.normalizedLevel || "")) {
+      throw new Error("เฉพาะ Admin หรือ Area เท่านั้นที่แก้ไขกรรมการระดับเขตได้");
+    }
+    const importer = actor.username || actor.userId || actor.email || "";
+    const timestamp = new Date();
+    const resolvedSchoolId = externalSchool ? EXTERNAL_JUDGE_SCHOOL_ID : (schoolRecord?.id || schoolIdInput);
+    const resolvedSchoolName = externalSchool ? EXTERNAL_JUDGE_SCHOOL_LABEL : (schoolRecord?.name || resolvedSchoolId);
+    sheet
+      .getRange(rowNumber, 1, 1, JUDGE_SHEET_HEADERS.length)
+      .setValues([[
+        activityId,
+        clusterKey,
+        resolvedClusterLabel,
+        resolvedSchoolId,
+        resolvedSchoolName,
+        judgeName,
+        role,
+        phone,
+        email,
+        importer,
+        timestamp,
+        stageScopeInput
+      ]]);
+    return {
+      success: true,
+      record: {
+        rowNumber,
+        activityId,
+        clusterKey,
+        clusterLabel: resolvedClusterLabel,
+        schoolId: resolvedSchoolId,
+        schoolName: resolvedSchoolName,
+        judgeName,
+        role,
+        phone,
+        email,
+        importedBy: importer,
+        importedAt: timestamp.toISOString(),
+        stageScope: stageScopeInput
+      }
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function deleteJudge(payload) {
+  try {
+    const data = payload || {};
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor) throw new Error("กรุณาเข้าสู่ระบบ");
+    const allowed = ["admin", "area", "group_admin"];
+    if (!allowed.includes(actor.normalizedLevel || "")) {
+      throw new Error("คุณไม่มีสิทธิ์ลบกรรมการ");
+    }
+    const rowNumber = parseInt(data.rowNumber, 10);
+    if (!rowNumber || rowNumber < 2) {
+      throw new Error("ข้อมูลกรรมการไม่ถูกต้อง");
+    }
+    const sheet = ensureJudgeSheet_(spreadsheet);
+    const lastRow = sheet.getLastRow();
+    if (rowNumber > lastRow) {
+      throw new Error("ไม่พบกรรมการที่ต้องการลบ");
+    }
+    const rowValues = sheet
+      .getRange(rowNumber, 1, 1, JUDGE_SHEET_HEADERS.length)
+      .getValues()[0];
+    if (!rowValues || !rowValues.some(value => value !== "")) {
+      throw new Error("ไม่พบข้อมูลกรรมการ");
+    }
+    const rowCluster = normalizeKey(rowValues[1] || "");
+    if (actor.normalizedLevel === "group_admin") {
+      if (!actor.clusterNormalized) {
+        throw new Error("บัญชีผู้ใช้นี้ยังไม่ได้ระบุเครือข่าย");
+      }
+      if (rowCluster !== actor.clusterNormalized) {
+        throw new Error("คุณสามารถจัดการเฉพาะเครือข่ายของคุณเท่านั้น");
+      }
+    }
+    sheet.deleteRow(rowNumber);
+    return {
+      success: true,
+      deletedRowNumber: rowNumber
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
@@ -1416,10 +2077,6 @@ function getReportData(options) {
   const teams = getRegisteredTeams();
   if (teams.error) return teams;
 
-  let totalTeams = teams.length;
-  let totalTeachers = 0;
-  let totalStudents = 0;
-
   const activitySummary = {};
 
   teams.forEach(team => {
@@ -1428,9 +2085,6 @@ function getReportData(options) {
       const members = JSON.parse(team.members || "{}");
       const teachers = Array.isArray(members.teachers) ? members.teachers.length : 0;
       const students = Array.isArray(members.students) ? members.students.length : 0;
-
-      totalTeachers += teachers;
-      totalStudents += students;
 
       if (!activitySummary[activityName]) {
         activitySummary[activityName] = { teams: 0, teachers: 0, students: 0 };
@@ -1446,8 +2100,13 @@ function getReportData(options) {
   const scoreAssignmentMap = getScoreAssignmentMap_(spreadsheet);
   const competitionStage = getCompetitionStage_();
   const stageTeamsGlobal = filterTeamsByCompetitionStage_(teams, competitionStage);
+  const totalsSourceTeams =
+    competitionStage === "area"
+      ? teams.filter(team => normalizeBooleanFlag_(team.representativeOverride))
+      : teams;
+  const totalsSummary = summarizeTeamList_(totalsSourceTeams);
   const competitionResultsGlobal = buildCompetitionResultsPayload_(stageTeamsGlobal, activityInfoMap, schoolsIndex);
-  const clusterLeaderboardGlobal = buildClusterLeaderboard_(stageTeamsGlobal, schoolsIndex);
+  const clusterLeaderboardGlobal = buildClusterLeaderboard_(stageTeamsGlobal, schoolsIndex, competitionStage);
   const clusterActivitySummaryGlobal = buildClusterActivitySummary_(stageTeamsGlobal, activityInfoMap, schoolsIndex);
 
   let userTotals = null;
@@ -1466,17 +2125,12 @@ function getReportData(options) {
     actorScoreActivities = scoreAssignmentMap.get((actor.userId || "").toString().trim()) || [];
     const scopedCompetitionTeams = filterTeamsByCompetitionStage_(scopedTeams, competitionStage);
     userCompetitionResults = buildCompetitionResultsPayload_(scopedCompetitionTeams, activityInfoMap, schoolsIndex);
-    clusterLeaderboardScoped = buildClusterLeaderboard_(scopedCompetitionTeams, schoolsIndex);
+    clusterLeaderboardScoped = buildClusterLeaderboard_(scopedCompetitionTeams, schoolsIndex, competitionStage);
     clusterActivitySummaryScoped = buildClusterActivitySummary_(scopedCompetitionTeams, activityInfoMap, schoolsIndex);
   }
 
   return {
-    totals: {
-      teams: totalTeams,
-      teachers: totalTeachers,
-      students: totalStudents,
-      allMembers: totalTeachers + totalStudents
-    },
+    totals: totalsSummary,
     summary: activitySummary,
     userTotals: userTotals,
     userSummary: userSummary,
@@ -1879,21 +2533,28 @@ function buildAreaFinalsFromTeams_(teams, activityMap, schoolsIndex) {
     .sort((a, b) => (a.activityName || "").localeCompare(b.activityName || "", "th"));
 }
 
-function buildClusterLeaderboard_(teams, schoolsIndex) {
+function buildClusterLeaderboard_(teams, schoolsIndex, stage) {
   const clusterMap = new Map();
   if (!Array.isArray(teams)) return [];
+  const normalizedStage = normalizeCompetitionStage_(stage || COMPETITION_STAGE_DEFAULT);
+  const useAreaMetrics = normalizedStage === "area";
   teams.forEach(team => {
-    const score = parseScoreValue_(team.scoreTotal);
-    if (score === null) return;
-    const medal = resolveMedalFromScore_(score);
+    const areaScore = parseScoreValue_(team.areaScore);
+    const areaRankRaw = parseInt((team.areaRank || "").toString().trim(), 10);
+    const areaRank = Number.isFinite(areaRankRaw) ? areaRankRaw : null;
+    const baseScore = useAreaMetrics ? areaScore : parseScoreValue_(team.scoreTotal);
+    if (!useAreaMetrics && baseScore === null) {
+      return;
+    }
+    if (useAreaMetrics && baseScore === null && areaRank === null) {
+      return;
+    }
+    const medal = resolveMedalFromScore_(baseScore);
     const schoolName = team.school || "ไม่ระบุสถานศึกษา";
-    const schoolInfo =
-      lookupSchoolByName_(schoolsIndex, schoolName) ||
-      null;
+    const schoolInfo = lookupSchoolByName_(schoolsIndex, schoolName) || null;
     const clusterKey =
       (schoolInfo && (schoolInfo.clusterId || schoolInfo.cluster)) || "unassigned";
-    const clusterLabel =
-      (schoolInfo && schoolInfo.cluster) || "ไม่ระบุเครือข่าย";
+    const clusterLabel = (schoolInfo && schoolInfo.cluster) || "ไม่ระบุเครือข่าย";
     if (!clusterMap.has(clusterKey)) {
       clusterMap.set(clusterKey, {
         key: clusterKey,
@@ -1907,15 +2568,63 @@ function buildClusterLeaderboard_(teams, schoolsIndex) {
         name: schoolName,
         medals: { gold: 0, silver: 0, bronze: 0, merit: 0, participant: 0 },
         totalScore: 0,
-        entries: 0
+        entries: 0,
+        areaStats: useAreaMetrics
+          ? {
+              representativeCount: 0,
+              bestRank: null,
+              bestScore: null,
+              scoreSum: 0,
+              scoreEntries: 0
+            }
+          : null
       });
     }
     const schoolEntry = clusterEntry.schools.get(schoolName);
     schoolEntry.medals[medal.key] = (schoolEntry.medals[medal.key] || 0) + 1;
-    schoolEntry.totalScore += score;
-    schoolEntry.entries += 1;
+    if (baseScore !== null) {
+      schoolEntry.totalScore += baseScore;
+      schoolEntry.entries += 1;
+    } else if (useAreaMetrics && areaRank !== null) {
+      schoolEntry.entries += 1;
+    }
+    if (useAreaMetrics && schoolEntry.areaStats) {
+      if (areaRank !== null) {
+        schoolEntry.areaStats.representativeCount += 1;
+        schoolEntry.areaStats.bestRank =
+          schoolEntry.areaStats.bestRank === null
+            ? areaRank
+            : Math.min(schoolEntry.areaStats.bestRank, areaRank);
+      }
+      if (baseScore !== null) {
+        schoolEntry.areaStats.scoreSum += baseScore;
+        schoolEntry.areaStats.scoreEntries += 1;
+        schoolEntry.areaStats.bestScore =
+          schoolEntry.areaStats.bestScore === null
+            ? baseScore
+            : Math.max(schoolEntry.areaStats.bestScore, baseScore);
+      }
+    }
   });
   const sortSchools = (a, b) => {
+    if (useAreaMetrics) {
+      const aStats = a.areaStats || {};
+      const bStats = b.areaStats || {};
+      const aBestRank =
+        typeof aStats.bestRank === "number" ? aStats.bestRank : Number.POSITIVE_INFINITY;
+      const bBestRank =
+        typeof bStats.bestRank === "number" ? bStats.bestRank : Number.POSITIVE_INFINITY;
+      if (aBestRank !== bBestRank) return aBestRank - bBestRank;
+      const aRep = aStats.representativeCount || 0;
+      const bRep = bStats.representativeCount || 0;
+      if (bRep !== aRep) return bRep - aRep;
+      const aBestScore =
+        typeof aStats.bestScore === "number" ? aStats.bestScore : -Infinity;
+      const bBestScore =
+        typeof bStats.bestScore === "number" ? bStats.bestScore : -Infinity;
+      if (bBestScore !== aBestScore) return bBestScore - aBestScore;
+      return (a.name || "").localeCompare(b.name || "", "th");
+    }
     const medals = ["gold", "silver", "bronze", "merit"];
     for (let i = 0; i < medals.length; i++) {
       const diff = (b.medals[medals[i]] || 0) - (a.medals[medals[i]] || 0);
@@ -1926,12 +2635,31 @@ function buildClusterLeaderboard_(teams, schoolsIndex) {
   return Array.from(clusterMap.values())
     .map(cluster => {
       const schools = Array.from(cluster.schools.values())
-        .map(entry => ({
-          name: entry.name,
-          medals: entry.medals,
-          totalScore: Number(entry.totalScore.toFixed(2)),
-          entries: entry.entries
-        }))
+        .map(entry => {
+          const payload = {
+            name: entry.name,
+            medals: entry.medals,
+            totalScore: Number(entry.totalScore.toFixed(2)),
+            entries: entry.entries
+          };
+          if (useAreaMetrics && entry.areaStats) {
+            payload.areaStats = {
+              representativeCount: entry.areaStats.representativeCount,
+              bestRank: entry.areaStats.bestRank,
+              bestScore:
+                entry.areaStats.bestScore === null
+                  ? null
+                  : Number(entry.areaStats.bestScore.toFixed(2)),
+              averageScore:
+                entry.areaStats.scoreEntries > 0
+                  ? Number(
+                      (entry.areaStats.scoreSum / entry.areaStats.scoreEntries).toFixed(2)
+                    )
+                  : null
+            };
+          }
+          return payload;
+        })
         .sort(sortSchools);
       return {
         key: cluster.key,
@@ -2017,8 +2745,7 @@ function saveActivityScores(request) {
       if (isGroupAdmin) {
         const schoolName = (row[3] || "").toString().trim();
         const schoolInfo = lookupSchoolByName_(schoolsIndex, schoolName);
-        const rowClusterKey = normalizeKey(schoolInfo?.cluster || "");
-        if (!rowClusterKey || rowClusterKey !== actor.clusterNormalized) {
+        if (!isSchoolWithinActorCluster_(actor, schoolInfo)) {
           disallowedTeams.push(entry.teamId);
           return;
         }
@@ -2037,6 +2764,74 @@ function saveActivityScores(request) {
     return { success: true };
   } catch (error) {
     Logger.log("saveActivityScores error: " + error);
+    return { success: false, error: error.message };
+  }
+}
+
+function transferRepresentativeAreaData(request) {
+  try {
+    const data = request || {};
+    const rawTeamIds = Array.isArray(data.teamIds) ? data.teamIds : [];
+    const teamIds = Array.from(
+      new Set(
+        rawTeamIds
+          .map(id => (id || "").toString().trim())
+          .filter(Boolean)
+      )
+    );
+    if (!teamIds.length) {
+      return { success: true, updated: 0, total: 0 };
+    }
+    const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+    const schoolsIndex = buildSchoolsIndex_(spreadsheet);
+    const actor = resolveActorContext_(data.actor, schoolsIndex);
+    if (!actor || !["admin", "area", "group_admin"].includes(actor.normalizedLevel)) {
+      throw new Error("คุณไม่มีสิทธิ์โอนข้อมูลทีมตัวแทน");
+    }
+    const sheet = spreadsheet.getSheetByName(SHEET_TEAMS);
+    if (!sheet) {
+      throw new Error("ไม่พบข้อมูลทีม");
+    }
+    ensureTeamSheetColumns_(sheet);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      return { success: true, updated: 0, total: teamIds.length };
+    }
+    const dataRange = sheet.getRange(2, 1, lastRow - 1, TEAM_SHEET_MAX_COLS);
+    const values = dataRange.getValues();
+    const areaNameIndex = TEAM_AREA_NAME_COLUMN_INDEX - 1;
+    const areaContactIndex = TEAM_AREA_CONTACT_COLUMN_INDEX - 1;
+    const areaMembersIndex = TEAM_AREA_MEMBERS_COLUMN_INDEX - 1;
+    const teamIndexMap = new Map();
+    values.forEach((row, idx) => {
+      const rowTeamId = (row[0] || "").toString().trim();
+      if (rowTeamId) {
+        teamIndexMap.set(rowTeamId, idx);
+      }
+    });
+    let updatedCount = 0;
+    teamIds.forEach(teamId => {
+      if (!teamIndexMap.has(teamId)) return;
+      const idx = teamIndexMap.get(teamId);
+      const row = values[idx];
+      const isRepresentative = normalizeBooleanFlag_(row[18]);
+      if (!isRepresentative) return;
+      if (actor.normalizedLevel === "group_admin") {
+        const schoolName = (row[3] || "").toString().trim();
+        const schoolRecord = lookupSchoolByName_(schoolsIndex, schoolName);
+        if (!isSchoolWithinActorCluster_(actor, schoolRecord)) {
+          return;
+        }
+      }
+      row[areaNameIndex] = row[2] || "";
+      row[areaContactIndex] = row[5] || "";
+      row[areaMembersIndex] = row[6] || "";
+      updatedCount++;
+    });
+    dataRange.setValues(values);
+    return { success: true, updated: updatedCount, total: teamIds.length };
+  } catch (error) {
+    Logger.log("transferRepresentativeAreaData error: " + error);
     return { success: false, error: error.message };
   }
 }
@@ -2596,6 +3391,8 @@ function buildSchoolsIndex_(spreadsheet) {
 
     ensureSchoolsSheetStructure_(schoolSheet);
     var clusterMap = buildSchoolClusterMap_(book);
+    index.clusterMap = clusterMap;
+    index.clustersByName = clusterMap ? clusterMap.byName : {};
     var lastRow = schoolSheet.getLastRow();
     if (lastRow < 2) return index;
 
@@ -2689,7 +3486,9 @@ function resolveActorContext_(actorInput, schoolIndex) {
     level: (actorInput.level || actorInput.role || "").toString().trim(),
     schoolId: (actorInput.schoolId || actorInput.SchoolID || "").toString().trim(),
     schoolName: (actorInput.schoolName || "").toString().trim(),
-    cluster: (actorInput.cluster || actorInput.schoolCluster || "").toString().trim()
+    cluster: (actorInput.cluster || actorInput.schoolCluster || "").toString().trim(),
+    clusterId: (actorInput.clusterId || actorInput.schoolClusterId || "").toString().trim(),
+    clusterLabel: (actorInput.clusterLabel || "").toString().trim()
   };
   if (!actor.userId) {
     return null;
@@ -2705,22 +3504,54 @@ function resolveActorContext_(actorInput, schoolIndex) {
     actor.level = DEFAULT_USER_LEVEL;
   }
   const index = schoolIndex || buildSchoolsIndex_();
+  const clusterMap = (index && index.clusterMap) || buildSchoolClusterMap_();
+  function applyClusterLookup(value) {
+    if (!value || !clusterMap) return;
+    const normalized = normalizeKey(value);
+    if (!normalized) return;
+    const hit = clusterMap.byId[normalized] || clusterMap.byName[normalized];
+    if (!hit) return;
+    if (!actor.clusterId) {
+      actor.clusterId = hit.id || normalized;
+    }
+    if (!actor.clusterLabel) {
+      actor.clusterLabel = hit.name || hit.id || "";
+    }
+  }
+  function applySchoolClusterInfo(school) {
+    if (!school) return;
+    actor.schoolName = actor.schoolName || school.name || "";
+    if (!actor.clusterId && (school.clusterId || school.cluster || school.clusterName)) {
+      actor.clusterId = school.clusterId || school.cluster || school.clusterName || "";
+    }
+    if (!actor.clusterLabel && (school.cluster || school.clusterName)) {
+      actor.clusterLabel = school.cluster || school.clusterName || "";
+    }
+    if (!actor.cluster && school.cluster) {
+      actor.cluster = school.cluster;
+    }
+  }
   if (!actor.schoolName && actor.schoolId) {
     const school = lookupSchoolById_(index, actor.schoolId);
-    if (school) {
-      actor.schoolName = school.name || actor.schoolName;
-      actor.cluster = actor.cluster || school.cluster || "";
-    }
+    applySchoolClusterInfo(school);
   }
-  if (!actor.cluster && actor.schoolName) {
+  if (!actor.clusterId && actor.schoolName) {
     const schoolByName = lookupSchoolByName_(index, actor.schoolName);
-    if (schoolByName) {
-      actor.cluster = schoolByName.cluster || actor.cluster;
-    }
+    applySchoolClusterInfo(schoolByName);
   }
+  if (actor.cluster) {
+    actor.clusterLabel = actor.clusterLabel || actor.cluster;
+  }
+  applyClusterLookup(actor.clusterId);
+  applyClusterLookup(actor.clusterLabel);
+  applyClusterLookup(actor.cluster);
   actor.normalizedLevel = normalizeKey(actor.level);
   actor.schoolNameNormalized = normalizeKey(actor.schoolName);
-  actor.clusterNormalized = normalizeKey(actor.cluster);
+  const clusterSource = actor.clusterId || actor.clusterLabel || actor.cluster || "";
+  actor.clusterNormalized = normalizeKey(clusterSource);
+  if (!actor.cluster && actor.clusterLabel) {
+    actor.cluster = actor.clusterLabel;
+  }
   return actor;
 }
 
@@ -2772,7 +3603,9 @@ function evaluateTeamPermission_(actor, teamRecord) {
       actor.clusterNormalized && actor.clusterNormalized === teamRecord.schoolClusterNormalized;
     const sameSchool =
       actor.schoolNameNormalized && actor.schoolNameNormalized === teamRecord.schoolNormalized;
-    return { canManage: !!(sameCluster || sameSchool), canEditStatus: false };
+    const competitionStage = getCompetitionStage_();
+    const allowStatusEdit = competitionStage === "cluster" && !!sameCluster;
+    return { canManage: !!(sameCluster || sameSchool), canEditStatus: allowStatusEdit };
   }
   return { canManage: false, canEditStatus: false };
 }
@@ -2841,6 +3674,12 @@ function updateTeamMembers(payload) {
     const teamStageValue = teamRecord.stage || normalizeCompetitionStage_(rowValues[TEAM_STAGE_COLUMN_INDEX - 1] || "");
     const requestedScope = normalizeCompetitionStage_(data.stageScope || "");
     const competitionStage = getCompetitionStage_();
+    const actorLevel = actor.normalizedLevel || "";
+    const groupAdminFullStatus =
+      permissions.canManage &&
+      actorLevel === "group_admin" &&
+      competitionStage === "cluster";
+    const canEditStatusFull = permissions.canEditStatus || groupAdminFullStatus;
     const allowAreaScope = competitionStage === "area";
     let stageScope = "cluster";
     if (requestedScope === "area" && (allowAreaScope || teamStageValue === "area")) {
@@ -2884,9 +3723,8 @@ function updateTeamMembers(payload) {
       typeof data.statusReason === "string" ? data.statusReason.trim() : "";
     const currentStatus = (updatedRow[9] || "").toString();
     const normalizedNextStatus = nextStatus.toLowerCase();
-    const actorLevel = actor.normalizedLevel || "";
     if (nextStatus) {
-      if (permissions.canEditStatus) {
+      if (canEditStatusFull) {
         updatedRow[9] = nextStatus;
       } else if (
         normalizedNextStatus === "rejected" &&
@@ -3175,12 +4013,15 @@ function exportTeams(format) {
           .join("\r\n");
 
       const fileName = "teams_" + timestamp + ".csv";
-      const blob = Utilities.newBlob(csvContent, "text/csv", fileName);
+      const blob = Utilities.newBlob("", "text/csv", fileName).setDataFromString(
+        csvContent,
+        "UTF-8"
+      );
 
       return {
         success: true,
         fileName: fileName,
-        mimeType: "text/csv",
+        mimeType: "text/csv;charset=UTF-8",
         data: Utilities.base64Encode(blob.getBytes())
       };
     }
@@ -3358,12 +4199,15 @@ function exportFilteredCsv(teams, activities) {
         .join("\r\n");
         
     const fileName = "teams_filtered_" + timestamp + ".csv";
-    const blob = Utilities.newBlob(csvContent, "text/csv", fileName);
+    const blob = Utilities.newBlob("", "text/csv", fileName).setDataFromString(
+      csvContent,
+      "UTF-8"
+    );
     
     return {
         success: true,
         fileName: fileName,
-        mimeType: "text/csv",
+        mimeType: "text/csv;charset=UTF-8",
         data: Utilities.base64Encode(blob.getBytes())
     };
 
@@ -3691,12 +4535,15 @@ function exportFilteredData(teams, activities, format) {
             .join("\r\n");
             
         const fileName = "teams_filtered_" + timestamp + ".csv";
-        const blob = Utilities.newBlob(csvContent, "text/csv", fileName);
+        const blob = Utilities.newBlob("", "text/csv", fileName).setDataFromString(
+            csvContent,
+            "UTF-8"
+        );
         
         return {
             success: true,
             fileName: fileName,
-            mimeType: "text/csv",
+            mimeType: "text/csv;charset=UTF-8",
             data: Utilities.base64Encode(blob.getBytes())
         };
     }
@@ -4259,6 +5106,9 @@ function getManagedUsers(request) {
         lookupSchoolById_(schoolsIndex, record.SchoolID) ||
         lookupSchoolByName_(schoolsIndex, record.SchoolID) ||
         lookupSchoolByName_(schoolsIndex, record.schoolName || "");
+      const clusterLabel = (schoolInfo && (schoolInfo.cluster || schoolInfo.clusterName)) || "";
+      const clusterId = (schoolInfo && (schoolInfo.clusterId || schoolInfo.cluster)) || "";
+      const normalizedCluster = normalizeKey(clusterId || clusterLabel);
       return {
         userId: record.userid || "",
         username: record.username || "",
@@ -4267,8 +5117,10 @@ function getManagedUsers(request) {
         level: (record.level || "").toString(),
         schoolId: record.SchoolID || "",
         schoolName: (schoolInfo && schoolInfo.name) || record.SchoolID || "",
-        cluster: (schoolInfo && schoolInfo.cluster) || "",
-        tel: record.tel || "",
+        cluster: clusterLabel,
+        clusterId: clusterId,
+        clusterNormalized: normalizedCluster,
+        tel: formatSheetPhoneValue_(record.tel || ""),
         email: record.email || "",
         scoreActivities: scoreAssignments.get((record.userid || "").toString().trim()) || []
       };
@@ -4277,11 +5129,17 @@ function getManagedUsers(request) {
     const filtered = users.filter(user => {
       if (actor.normalizedLevel === "admin" || actor.normalizedLevel === "area") return true;
       if (actor.normalizedLevel === "group_admin") {
-        return actor.clusterNormalized && normalize(user.cluster) === actor.clusterNormalized;
+        const actorCluster = actor.clusterNormalized;
+        if (!actorCluster) return false;
+        const userCluster =
+          user.clusterNormalized ||
+          normalize(user.clusterId || user.cluster || user.clusterLabel);
+        return Boolean(userCluster) && userCluster === actorCluster;
       }
       if (actor.normalizedLevel === "school_admin") {
         if (!actor.schoolId) return false;
-        return normalize(user.schoolId) === normalize(actor.schoolId);
+        const actorSchool = normalize(actor.schoolId);
+        return actorSchool && normalize(user.schoolId) === actorSchool;
       }
       return user.userId === actor.userId;
     });
